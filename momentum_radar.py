@@ -3,7 +3,6 @@ import io
 import re
 import json
 import time
-import math
 import requests
 import warnings
 from dataclasses import dataclass, asdict
@@ -21,27 +20,22 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ------------------------------------------------------------
 # 목적
 # - 펀더멘털 완전 배제
-# - 가격 / 거래대금 / 시장상태 / 산업강도 / RS / 압축 / 거래량만 사용
-# - 짧은 보유, 순수 돌파 중심
-# - 실행할 때마다 텔레그램으로 항상 결과 전송
+# - 가격 / 거래대금 / 시장상태 / 브레드스 / 산업강도 / RS / 압축 / 돌파만 사용
+# - 짧은 보유를 전제로 한 순수 돌파 후보 탐지
+# - 시장 레짐이 약해도 후보는 항상 출력
+# - 텔레그램은 매 실행마다 항상 전송
 #
-# 핵심 구성
-# 1) 시장 레짐
-# 2) 브레드스
-# 3) 산업 강도
+# 구조
+# 1) 시장 레짐 3단계 분류
+# 2) 시장 브레드스 계산
+# 3) 산업 강도 계산
 # 4) RS 랭킹
 # 5) RS 라인 신고가
-# 6) 타이트 구조
-# 7) 거래량 폭발
-# 8) 55일 / 35일 돌파 후보
-# 9) 갭 허용치 / 매수 트리거 / 손절
-# 10) 점수 정렬
-#
-# 출력
-# - 시장 요약
-# - 상위 산업
-# - 계좌 A(55일) 후보
-# - 계좌 B(35일) 후보
+# 6) 10일 타이트 구조
+# 7) 55일 / 35일 돌파 후보
+# 8) 베이스 깊이 필터
+# 9) 브레드스에 따라 후보 수 자동 제한
+# 10) 텔레그램 한글 출력
 # ============================================================
 
 # ============================================================
@@ -77,16 +71,17 @@ MIN_PRICE = 10.0
 MIN_AVG_DOLLAR_VOLUME = 10_000_000
 LOOKBACK_PERIOD = "1y"
 CHUNK_SIZE = 100
-CHUNK_SLEEP_SEC = 0.5
+CHUNK_SLEEP_SEC = 0.35
 
 # 시장 레짐
 SPY_50MA_DAYS = 50
 SPY_200MA_DAYS = 200
+SPY_3M_LOOKBACK = 63
 SPY_6M_LOOKBACK = 126
 
-# 브레드스 기준
+# 브레드스
 BREADTH_STRONG_50MA = 0.60
-BREADTH_WEAK_50MA = 0.40
+BREADTH_NEUTRAL_50MA = 0.45
 
 # 모멘텀 점수
 MOM_3M_LOOKBACK = 63
@@ -101,10 +96,10 @@ MIN_RS_PERCENTILE_B = 75.0
 # 돌파
 BREAKOUT_A_DAYS = 55
 BREAKOUT_B_DAYS = 35
-NEAR_BREAKOUT_MIN = -0.05     # -5%
-NEAR_BREAKOUT_MAX = 0.03      # +3%
-ENTRY_BUFFER_PCT = 0.001      # 돌파가 0.1% 위
-LIMIT_BUFFER_PCT = 0.03       # 허용 갭 / 리밋 +3%
+NEAR_BREAKOUT_MIN = -0.03   # 돌파가 대비 -3%
+NEAR_BREAKOUT_MAX = 0.02    # 돌파가 대비 +2%
+ENTRY_BUFFER_PCT = 0.001    # 돌파가 0.1% 위
+LIMIT_BUFFER_PCT = 0.03     # 허용 갭 +3%
 
 # 손절
 STOP_A_PCT = 0.12
@@ -114,8 +109,10 @@ STOP_B_PCT = 0.10
 TIGHT_10D_MAX = 0.08
 STRICT_TIGHT_10D_MAX = 0.05
 MAX_EXTENSION_FROM_50MA = 0.25
+MAX_BASE_DEPTH = 0.20
 
 # 거래량
+MIN_VOLUME_RATIO = 1.0
 RELATIVE_VOLUME_STRONG = 1.50
 RELATIVE_VOLUME_VERY_STRONG = 2.00
 
@@ -169,10 +166,13 @@ class Candidate:
     rs_line_new_high: bool
     tight_10d: bool
     tight_10d_width_pct: Optional[float]
+    base_depth_pct: Optional[float]
     sector: Optional[str]
+    industry: Optional[str]
     sector_etf: Optional[str]
     sector_ret_3m: Optional[float]
     sector_ret_6m: Optional[float]
+    industry_bonus: float
     breakout_group_rank: Optional[int] = None
 
 
@@ -182,9 +182,6 @@ class Candidate:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-def today_str() -> str:
-    return utc_now_iso()[:10]
 
 def safe_float(v, default=np.nan) -> float:
     try:
@@ -266,10 +263,19 @@ def tight_range_ratio(df: pd.DataFrame, window: int = 10) -> float:
         return np.nan
     return (hi - lo) / hi
 
+def compute_base_depth(df: pd.DataFrame, breakout_days: int) -> float:
+    if df is None or df.empty or len(df) < breakout_days:
+        return np.nan
+    base = df.tail(breakout_days).copy()
+    hi = safe_float(base["High"].max())
+    lo = safe_float(base["Low"].min())
+    if not np.isfinite(hi) or not np.isfinite(lo) or hi <= 0:
+        return np.nan
+    return (hi - lo) / hi
+
 def download_chunk(symbols: List[str], period: str = LOOKBACK_PERIOD) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-
     return yf.download(
         tickers=symbols,
         period=period,
@@ -339,6 +345,7 @@ def load_universe_symbols() -> List[str]:
     nasdaq = fetch_nasdaq_listed()
     other = fetch_other_listed()
     raw = nasdaq["Symbol"].tolist() + other["ACT Symbol"].tolist()
+
     cleaned = []
     for s in raw:
         x = normalize_symbol(s)
@@ -351,6 +358,7 @@ def load_universe_symbols() -> List[str]:
         if not re.fullmatch(r"[A-Z\-]+", x):
             continue
         cleaned.append(x)
+
     return sorted(list(set(cleaned)))
 
 
@@ -377,32 +385,41 @@ def shorten_company_name(name: Optional[str]) -> Optional[str]:
     short = re.sub(r"\s+", " ", short).strip(" ,-")
     return short[:40] if short else None
 
-def get_symbol_meta(symbol: str, cache: Dict[str, dict]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def get_symbol_meta(symbol: str, cache: Dict[str, dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     cached = cache.get(symbol)
     if cached and cached.get("updated_at"):
-        return cached.get("name"), cached.get("sector"), cached.get("sector_etf")
+        return (
+            cached.get("name"),
+            cached.get("sector"),
+            cached.get("industry"),
+            cached.get("sector_etf"),
+        )
 
     company_name = None
     sector = None
+    industry = None
     sector_etf = None
 
     try:
         info = yf.Ticker(symbol).info
         company_name = shorten_company_name(info.get("shortName") or info.get("longName"))
         sector = info.get("sector")
+        industry = info.get("industry")
         sector_etf = SECTOR_TO_ETF.get(sector)
     except Exception:
         company_name = None
         sector = None
+        industry = None
         sector_etf = None
 
     cache[symbol] = {
         "name": company_name,
         "sector": sector,
+        "industry": industry,
         "sector_etf": sector_etf,
         "updated_at": utc_now_iso(),
     }
-    return company_name, sector, sector_etf
+    return company_name, sector, industry, sector_etf
 
 def get_sector_return_map() -> Dict[str, dict]:
     etfs = ["SPY"] + sorted(set(v for v in SECTOR_TO_ETF.values() if v))
@@ -421,17 +438,41 @@ def get_sector_return_map() -> Dict[str, dict]:
 
     return result
 
+def industry_strength_table(sector_return_map: Dict[str, dict]) -> List[Tuple[str, float, float, float]]:
+    rows = []
+    for sector_name, etf in SECTOR_TO_ETF.items():
+        data = sector_return_map.get(etf, {})
+        r3 = safe_float(data.get("ret_3m"))
+        r6 = safe_float(data.get("ret_6m"))
+        if np.isfinite(r3) and np.isfinite(r6):
+            score = 0.60 * r6 + 0.40 * r3
+            rows.append((sector_name, r3, r6, score))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    return rows
+
+def build_industry_bonus_map(top_industries: List[Tuple[str, float, float, float]]) -> Dict[str, float]:
+    bonus_map: Dict[str, float] = {}
+    for rank, (sector_name, _, _, _) in enumerate(top_industries, start=1):
+        if rank <= 3:
+            bonus_map[sector_name] = 5.0
+        elif rank <= 5:
+            bonus_map[sector_name] = 3.0
+        else:
+            bonus_map[sector_name] = 0.0
+    return bonus_map
+
 
 # ============================================================
 # MARKET REGIME / BREADTH
 # ============================================================
 
-def get_market_regime(spy_df: pd.DataFrame) -> Tuple[bool, Dict[str, float]]:
+def get_market_regime(spy_df: pd.DataFrame, breadth_50ma: float) -> Tuple[str, str, Dict[str, float]]:
     if spy_df is None or spy_df.empty or len(spy_df) < SPY_200MA_DAYS:
-        return False, {
+        return "데이터부족", "판단 불가", {
             "spy_close": np.nan,
             "spy_50ma": np.nan,
             "spy_200ma": np.nan,
+            "spy_3m_ret": np.nan,
             "spy_6m_ret": np.nan,
         }
 
@@ -439,9 +480,18 @@ def get_market_regime(spy_df: pd.DataFrame) -> Tuple[bool, Dict[str, float]]:
     spy_close = safe_float(close.iloc[-1])
     spy_50ma = safe_float(rolling_ma(close, SPY_50MA_DAYS).iloc[-1])
     spy_200ma = safe_float(rolling_ma(close, SPY_200MA_DAYS).iloc[-1])
+    spy_3m_ret = compute_return(close, SPY_3M_LOOKBACK)
     spy_6m_ret = compute_return(close, SPY_6M_LOOKBACK)
 
-    regime_ok = bool(
+    info = {
+        "spy_close": spy_close,
+        "spy_50ma": spy_50ma,
+        "spy_200ma": spy_200ma,
+        "spy_3m_ret": spy_3m_ret,
+        "spy_6m_ret": spy_6m_ret,
+    }
+
+    strong = (
         np.isfinite(spy_close)
         and np.isfinite(spy_50ma)
         and np.isfinite(spy_200ma)
@@ -449,14 +499,22 @@ def get_market_regime(spy_df: pd.DataFrame) -> Tuple[bool, Dict[str, float]]:
         and spy_close > spy_200ma
         and spy_50ma > spy_200ma
         and spy_6m_ret > 0
+        and np.isfinite(breadth_50ma)
+        and breadth_50ma >= BREADTH_STRONG_50MA
+    )
+    neutral = (
+        np.isfinite(spy_close)
+        and np.isfinite(spy_200ma)
+        and spy_close > spy_200ma
+        and np.isfinite(breadth_50ma)
+        and breadth_50ma >= BREADTH_NEUTRAL_50MA
     )
 
-    return regime_ok, {
-        "spy_close": spy_close,
-        "spy_50ma": spy_50ma,
-        "spy_200ma": spy_200ma,
-        "spy_6m_ret": spy_6m_ret,
-    }
+    if strong:
+        return "강세", "정상 진입 가능", info
+    if neutral:
+        return "중립", "상위 후보만 선별 진입", info
+    return "약세", "후보는 관찰, 진입은 매우 보수적", info
 
 def compute_last_3_trading_dates(spy_df: pd.DataFrame) -> List[str]:
     if spy_df is None or spy_df.empty:
@@ -507,10 +565,19 @@ def breadth_comment(breadth_50ma: float) -> str:
     if not np.isfinite(breadth_50ma):
         return "브레드스 계산 불가"
     if breadth_50ma >= BREADTH_STRONG_50MA:
-        return "브레드스 강함, 정상 매매 가능"
-    if breadth_50ma >= BREADTH_WEAK_50MA:
-        return "브레드스 중립, 선별 진입"
-    return "브레드스 약함, 신규 진입 보수적"
+        return "브레드스 강함, 후보 수 넓게 유지"
+    if breadth_50ma >= BREADTH_NEUTRAL_50MA:
+        return "브레드스 중립, 후보 수 축소"
+    return "브레드스 약함, 최상위 후보만 유지"
+
+def candidate_limit_by_breadth(breadth_50ma: float) -> int:
+    if not np.isfinite(breadth_50ma):
+        return 4
+    if breadth_50ma >= BREADTH_STRONG_50MA:
+        return 10
+    if breadth_50ma >= BREADTH_NEUTRAL_50MA:
+        return 6
+    return 3
 
 
 # ============================================================
@@ -572,7 +639,6 @@ def score_relative_volume(vr: float) -> float:
 def score_breakout_distance(distance_pct: float) -> float:
     if not np.isfinite(distance_pct):
         return 0.0
-    # 0% 근처가 가장 좋음
     abs_dist = abs(distance_pct)
     if abs_dist <= 1.0:
         return 1.0
@@ -580,8 +646,17 @@ def score_breakout_distance(distance_pct: float) -> float:
         return 0.75
     if abs_dist <= 3.0:
         return 0.50
-    if abs_dist <= 5.0:
-        return 0.25
+    return 0.20
+
+def score_base_depth(base_depth: float) -> float:
+    if not np.isfinite(base_depth):
+        return 0.0
+    if base_depth <= 0.12:
+        return 1.0
+    if base_depth <= 0.16:
+        return 0.75
+    if base_depth <= MAX_BASE_DEPTH:
+        return 0.45
     return 0.0
 
 def build_total_score(
@@ -590,21 +665,26 @@ def build_total_score(
     width_10d: float,
     volume_ratio_20d: float,
     distance_to_breakout_pct: float,
+    base_depth: float,
+    industry_bonus: float,
 ) -> float:
     rs_component = rs_percentile / 100.0
     rs_line_component = 1.0 if rs_line_new_high else 0.0
     tight_component = score_tightness(width_10d)
     volume_component = score_relative_volume(volume_ratio_20d)
     distance_component = score_breakout_distance(distance_to_breakout_pct)
+    base_component = score_base_depth(base_depth)
 
-    total = (
-        0.40 * rs_component
+    raw = (
+        0.35 * rs_component
         + 0.20 * rs_line_component
         + 0.15 * tight_component
-        + 0.15 * volume_component
+        + 0.10 * volume_component
         + 0.10 * distance_component
-    )
-    return round(total * 100.0, 2)
+        + 0.10 * base_component
+    ) * 100.0
+
+    return round(raw + industry_bonus, 2)
 
 
 # ============================================================
@@ -617,9 +697,11 @@ def build_candidate_for_account(
     df: pd.DataFrame,
     spy_df: pd.DataFrame,
     sector: Optional[str],
+    industry: Optional[str],
     sector_etf: Optional[str],
     sector_ret_3m: Optional[float],
     sector_ret_6m: Optional[float],
+    industry_bonus: float,
     rs_percentile: float,
     rs_score: float,
     breakout_days: int,
@@ -666,7 +748,6 @@ def build_candidate_for_account(
     if rs_percentile < min_rs_percentile:
         return None
 
-    # breakout price = 직전 breakout_days 최고가
     breakout_price = safe_float(high.iloc[-(breakout_days + 1):-1].max())
     if not np.isfinite(breakout_price) or breakout_price <= 0:
         return None
@@ -677,6 +758,10 @@ def build_candidate_for_account(
 
     width_10d = tight_range_ratio(df, 10)
     tight_10d = bool(np.isfinite(width_10d) and width_10d <= TIGHT_10D_MAX)
+
+    base_depth = compute_base_depth(df, breakout_days)
+    if not np.isfinite(base_depth) or base_depth > MAX_BASE_DEPTH:
+        return None
 
     rs_line_new_high = compute_rs_line_new_high(df, spy_df, lookback=126)
 
@@ -694,6 +779,8 @@ def build_candidate_for_account(
         width_10d=width_10d,
         volume_ratio_20d=vol_ratio_20,
         distance_to_breakout_pct=distance_to_breakout * 100.0,
+        base_depth=base_depth,
+        industry_bonus=industry_bonus,
     )
 
     return Candidate(
@@ -721,10 +808,13 @@ def build_candidate_for_account(
         rs_line_new_high=rs_line_new_high,
         tight_10d=tight_10d,
         tight_10d_width_pct=width_10d * 100.0 if np.isfinite(width_10d) else None,
+        base_depth_pct=base_depth * 100.0 if np.isfinite(base_depth) else None,
         sector=sector,
+        industry=industry,
         sector_etf=sector_etf,
         sector_ret_3m=sector_ret_3m,
         sector_ret_6m=sector_ret_6m,
+        industry_bonus=industry_bonus,
     )
 
 def rank_candidates_by_group(candidates: List[Candidate]) -> List[Candidate]:
@@ -778,20 +868,9 @@ def send_telegram_messages(texts: List[str], delay_sec: float = 1.0) -> None:
 # MESSAGE FORMAT
 # ============================================================
 
-def industry_strength_table(sector_return_map: Dict[str, dict]) -> List[Tuple[str, float, float]]:
-    rows = []
-    for sector_name, etf in SECTOR_TO_ETF.items():
-        data = sector_return_map.get(etf, {})
-        r3 = safe_float(data.get("ret_3m"))
-        r6 = safe_float(data.get("ret_6m"))
-        if np.isfinite(r3) and np.isfinite(r6):
-            score = 0.60 * r6 + 0.40 * r3
-            rows.append((sector_name, r3, r6, score))
-    rows.sort(key=lambda x: x[3], reverse=True)
-    return [(name, r3, r6) for name, r3, r6, _ in rows]
-
 def format_market_summary_message(
-    regime_ok: bool,
+    regime_level: str,
+    regime_action: str,
     regime_info: Dict[str, float],
     breadth_info: Dict[str, float],
     last_3_dates: List[str],
@@ -801,7 +880,8 @@ def format_market_summary_message(
     all_candidate_count: int,
     a_count: int,
     b_count: int,
-    top_industries: List[Tuple[str, float, float]],
+    display_limit: int,
+    top_industries: List[Tuple[str, float, float, float]],
 ) -> str:
     lines = []
     lines.append("순수 모멘텀 레이더")
@@ -815,10 +895,12 @@ def format_market_summary_message(
         lines.append("")
 
     lines.append("시장 레짐")
-    lines.append(f"- 상태: {'ON' if regime_ok else 'OFF'}")
+    lines.append(f"- 단계: {regime_level}")
+    lines.append(f"- 해석: {regime_action}")
     lines.append(f"- SPY 종가: {price_str(regime_info.get('spy_close'))}")
     lines.append(f"- SPY 50일선: {price_str(regime_info.get('spy_50ma'))}")
     lines.append(f"- SPY 200일선: {price_str(regime_info.get('spy_200ma'))}")
+    lines.append(f"- SPY 3개월 수익률: {pct_str(regime_info.get('spy_3m_ret'))}")
     lines.append(f"- SPY 6개월 수익률: {pct_str(regime_info.get('spy_6m_ret'))}")
     lines.append("")
 
@@ -826,11 +908,12 @@ def format_market_summary_message(
     lines.append(f"- 50일선 위 종목 비율: {pct_str(breadth_info.get('breadth_50ma'))}")
     lines.append(f"- 200일선 위 종목 비율: {pct_str(breadth_info.get('breadth_200ma'))}")
     lines.append(f"- 해석: {breadth_comment(breadth_info.get('breadth_50ma'))}")
+    lines.append(f"- 이번 출력 후보 제한 수: 계좌별 상위 {display_limit}개")
     lines.append("")
 
     lines.append("현재 강한 산업")
     if top_industries:
-        for i, (name, r3, r6) in enumerate(top_industries[:5], start=1):
+        for i, (name, r3, r6, _) in enumerate(top_industries[:5], start=1):
             lines.append(f"- {i}. {name} | 3개월 {pct_str(r3)} | 6개월 {pct_str(r6)}")
     else:
         lines.append("- 계산 불가")
@@ -872,11 +955,18 @@ def format_candidate_block(title: str, candidates: List[Candidate]) -> str:
         lines.append(f"거래량 배수(20일): {c.volume_ratio_20d:.2f}x")
         lines.append(f"RS 라인 신고가: {'예' if c.rs_line_new_high else '아니오'}")
         lines.append(f"10일 타이트 구조: {'예' if c.tight_10d else '아니오'}")
-        lines.append(f"10일 변동폭: {pct_str(c.tight_10d_width_pct / 100.0) if c.tight_10d_width_pct is not None else '-'}")
+        lines.append(f"10일 변동폭: {c.tight_10d_width_pct:.2f}%" if c.tight_10d_width_pct is not None else "10일 변동폭: -")
+        lines.append(f"베이스 깊이: {c.base_depth_pct:.2f}%" if c.base_depth_pct is not None else "베이스 깊이: -")
         lines.append(f"50일선 대비 확장: {c.extension_from_50ma_pct:.2f}%")
-        if c.sector:
-            lines.append(f"산업군: {c.sector}")
+        lines.append(f"섹터: {c.sector or '-'}")
+        lines.append(f"산업: {c.industry or '-'}")
+        if c.sector_ret_3m is not None and c.sector_ret_6m is not None:
+            lines.append(f"산업 강도(ETF): 3개월 {pct_str(c.sector_ret_3m)} | 6개월 {pct_str(c.sector_ret_6m)}")
+        else:
+            lines.append("산업 강도(ETF): -")
+        lines.append(f"산업 보너스: +{c.industry_bonus:.1f}")
         lines.append("")
+
     return "\n".join(lines).strip()
 
 
@@ -889,29 +979,28 @@ def main():
 
     meta_cache = load_meta_cache()
 
-    # 1. Universe
+    # 1. 유니버스
     universe = load_universe_symbols()
     print(f"[1] 유니버스 수: {len(universe)}")
 
-    # 2. SPY / regime
+    # 2. SPY
     spy_download = download_chunk(["SPY"], period=LOOKBACK_PERIOD)
     spy_df = extract_symbol_ohlcv(spy_download, "SPY")
     if spy_df is None or spy_df.empty:
         raise RuntimeError("SPY 다운로드 실패")
 
-    regime_ok, regime_info = get_market_regime(spy_df)
     last_3_dates = compute_last_3_trading_dates(spy_df)
-    print(f"[2] 시장 레짐: {'ON' if regime_ok else 'OFF'}")
 
-    # 3. Sector returns
+    # 3. 섹터 강도
     sector_return_map = get_sector_return_map()
     top_industries = industry_strength_table(sector_return_map)
-    print(f"[3] 산업 강도 계산 완료")
+    industry_bonus_map = build_industry_bonus_map(top_industries)
+    print("[2] 산업 강도 계산 완료")
 
-    # 4. Download universe
+    # 4. 전체 유니버스 다운로드
     all_frames: Dict[str, pd.DataFrame] = {}
     chunks = chunked(universe, CHUNK_SIZE)
-    print(f"[4] 다운로드 청크 수: {len(chunks)}")
+    print(f"[3] 다운로드 청크 수: {len(chunks)}")
 
     for i, chunk in enumerate(chunks, start=1):
         print(f"  - 청크 {i}/{len(chunks)} | 크기={len(chunk)}")
@@ -937,15 +1026,21 @@ def main():
 
         time.sleep(CHUNK_SLEEP_SEC)
 
-    print(f"[5] 다운로드 성공 수: {len(all_frames)}")
+    print(f"[4] 다운로드 성공 수: {len(all_frames)}")
     if not all_frames:
         raise RuntimeError("다운로드 성공 종목 없음")
 
-    # 5. Breadth
+    # 5. 브레드스
     breadth_info = compute_breadth(all_frames)
-    print(f"[6] 브레드스 계산 완료")
+    regime_level, regime_action, regime_info = get_market_regime(
+        spy_df=spy_df,
+        breadth_50ma=safe_float(breadth_info.get("breadth_50ma")),
+    )
+    display_limit = candidate_limit_by_breadth(safe_float(breadth_info.get("breadth_50ma")))
+    print(f"[5] 시장 레짐: {regime_level}")
+    print(f"[6] 브레드스 제한 수: {display_limit}")
 
-    # 6. RS ranking
+    # 6. RS 랭킹
     rs_rows = []
     for sym, df in all_frames.items():
         try:
@@ -963,7 +1058,7 @@ def main():
     rs_map = rs_df.set_index("symbol").to_dict(orient="index")
     print(f"[7] RS 점수 계산 수: {len(rs_df)}")
 
-    # 7. Candidate build
+    # 7. 후보 생성
     all_candidates: List[Candidate] = []
     account_a: List[Candidate] = []
     account_b: List[Candidate] = []
@@ -972,13 +1067,17 @@ def main():
         if sym not in rs_map:
             continue
 
-        company_name, sector, sector_etf = get_symbol_meta(sym, meta_cache)
+        company_name, sector, industry, sector_etf = get_symbol_meta(sym, meta_cache)
+
         sector_ret_3m = None
         sector_ret_6m = None
         if sector_etf:
-            sector_ret_3m = safe_float(sector_return_map.get(sector_etf, {}).get("ret_3m"))
-            sector_ret_6m = safe_float(sector_return_map.get(sector_etf, {}).get("ret_6m"))
+            r3 = safe_float(sector_return_map.get(sector_etf, {}).get("ret_3m"))
+            r6 = safe_float(sector_return_map.get(sector_etf, {}).get("ret_6m"))
+            sector_ret_3m = r3 if np.isfinite(r3) else None
+            sector_ret_6m = r6 if np.isfinite(r6) else None
 
+        industry_bonus = industry_bonus_map.get(sector, 0.0) if sector else 0.0
         info = rs_map[sym]
 
         candidate_a = build_candidate_for_account(
@@ -987,9 +1086,11 @@ def main():
             df=df,
             spy_df=spy_df,
             sector=sector,
+            industry=industry,
             sector_etf=sector_etf,
-            sector_ret_3m=sector_ret_3m if np.isfinite(sector_ret_3m) else None,
-            sector_ret_6m=sector_ret_6m if np.isfinite(sector_ret_6m) else None,
+            sector_ret_3m=sector_ret_3m,
+            sector_ret_6m=sector_ret_6m,
+            industry_bonus=industry_bonus,
             rs_percentile=float(info["rs_percentile"]),
             rs_score=float(info["rs_score"]),
             breakout_days=BREAKOUT_A_DAYS,
@@ -1007,9 +1108,11 @@ def main():
             df=df,
             spy_df=spy_df,
             sector=sector,
+            industry=industry,
             sector_etf=sector_etf,
-            sector_ret_3m=sector_ret_3m if np.isfinite(sector_ret_3m) else None,
-            sector_ret_6m=sector_ret_6m if np.isfinite(sector_ret_6m) else None,
+            sector_ret_3m=sector_ret_3m,
+            sector_ret_6m=sector_ret_6m,
+            industry_bonus=industry_bonus,
             rs_percentile=float(info["rs_percentile"]),
             rs_score=float(info["rs_score"]),
             breakout_days=BREAKOUT_B_DAYS,
@@ -1023,6 +1126,11 @@ def main():
 
     account_a = rank_candidates_by_group(account_a)
     account_b = rank_candidates_by_group(account_b)
+
+    # 브레드스 기반 출력 수 제한
+    account_a_display = account_a[:display_limit]
+    account_b_display = account_b[:display_limit]
+
     all_candidates = sorted(
         all_candidates,
         key=lambda x: (
@@ -1037,37 +1145,35 @@ def main():
     print(f"[9] 계좌 A 후보 수: {len(account_a)}")
     print(f"[10] 계좌 B 후보 수: {len(account_b)}")
 
-    # 8. Save outputs
+    # 8. 저장
     all_df = pd.DataFrame([asdict(c) for c in all_candidates]) if all_candidates else pd.DataFrame()
     a_df = pd.DataFrame([asdict(c) for c in account_a]) if account_a else pd.DataFrame()
     b_df = pd.DataFrame([asdict(c) for c in account_b]) if account_b else pd.DataFrame()
 
+    cols = [f.name for f in Candidate.__dataclass_fields__.values()]
+
     if all_df.empty:
-        pd.DataFrame(columns=[f.name for f in Candidate.__dataclass_fields__.values()]).to_csv(
-            ALL_CSV, index=False, encoding="utf-8-sig"
-        )
+        pd.DataFrame(columns=cols).to_csv(ALL_CSV, index=False, encoding="utf-8-sig")
     else:
         all_df.to_csv(ALL_CSV, index=False, encoding="utf-8-sig")
 
     if a_df.empty:
-        pd.DataFrame(columns=[f.name for f in Candidate.__dataclass_fields__.values()]).to_csv(
-            A_CSV, index=False, encoding="utf-8-sig"
-        )
+        pd.DataFrame(columns=cols).to_csv(A_CSV, index=False, encoding="utf-8-sig")
     else:
         a_df.to_csv(A_CSV, index=False, encoding="utf-8-sig")
 
     if b_df.empty:
-        pd.DataFrame(columns=[f.name for f in Candidate.__dataclass_fields__.values()]).to_csv(
-            B_CSV, index=False, encoding="utf-8-sig"
-        )
+        pd.DataFrame(columns=cols).to_csv(B_CSV, index=False, encoding="utf-8-sig")
     else:
         b_df.to_csv(B_CSV, index=False, encoding="utf-8-sig")
 
     summary = {
         "updated_at": utc_now_iso(),
-        "market_regime": "ON" if regime_ok else "OFF",
+        "market_regime": regime_level,
+        "market_action": regime_action,
         "regime_info": regime_info,
         "breadth_info": breadth_info,
+        "display_limit": display_limit,
         "last_3_trading_dates": last_3_dates,
         "universe_count": len(universe),
         "downloaded_count": len(all_frames),
@@ -1076,7 +1182,7 @@ def main():
         "account_a_count": len(account_a),
         "account_b_count": len(account_b),
         "top_industries": [
-            {"sector": x[0], "ret_3m": x[1], "ret_6m": x[2]}
+            {"sector": x[0], "ret_3m": x[1], "ret_6m": x[2], "score": x[3]}
             for x in top_industries[:10]
         ],
         "top_candidates": [asdict(c) for c in all_candidates[:20]],
@@ -1084,9 +1190,10 @@ def main():
     save_json(SUMMARY_JSON, summary)
     save_meta_cache(meta_cache)
 
-    # 9. Telegram always
+    # 9. 텔레그램 항상 전송
     msg_summary = format_market_summary_message(
-        regime_ok=regime_ok,
+        regime_level=regime_level,
+        regime_action=regime_action,
         regime_info=regime_info,
         breadth_info=breadth_info,
         last_3_dates=last_3_dates,
@@ -1096,14 +1203,15 @@ def main():
         all_candidate_count=len(all_candidates),
         a_count=len(account_a),
         b_count=len(account_b),
+        display_limit=display_limit,
         top_industries=top_industries,
     )
-    msg_a = format_candidate_block("계좌 A | 55일 돌파 후보", account_a)
-    msg_b = format_candidate_block("계좌 B | 35일 돌파 후보", account_b)
+    msg_a = format_candidate_block("계좌 A | 55일 돌파 후보", account_a_display)
+    msg_b = format_candidate_block("계좌 B | 35일 돌파 후보", account_b_display)
 
     send_telegram_messages([msg_summary, msg_a, msg_b], delay_sec=1.0)
 
-    # 10. Console preview
+    # 10. 콘솔 미리보기
     print("[11] 상위 후보 미리보기")
     for c in all_candidates[:20]:
         print(
